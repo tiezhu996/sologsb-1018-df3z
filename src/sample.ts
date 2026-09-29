@@ -1,4 +1,5 @@
-import type { PracticeProject } from './types'
+import type { PracticeProject, WorkspaceState } from './types'
+import { workspaceFromProject } from './versioning'
 
 export function createSampleProject(): PracticeProject {
   const groups = [
@@ -60,4 +61,9 @@ export function createSampleProject(): PracticeProject {
     errorCategories: ['声调', '韵尾', '重音位置', '连读', '气息', '语速'],
     updatedAt: new Date().toISOString()
   }
+}
+
+/** 示例工作区：示例练习首次生成时也自带一份版本，版本库从一开始就可用 */
+export function createSampleWorkspace(): WorkspaceState {
+  return workspaceFromProject(createSampleProject())
 }

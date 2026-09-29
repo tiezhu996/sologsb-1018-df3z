@@ -1,9 +1,28 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import { ProgressBar } from '@skeletonlabs/skeleton'
-  import { createSampleProject } from './sample'
-  import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import { createSampleWorkspace } from './sample'
+  import { clearWorkspace, getAudio, loadWorkspace, persistWorkspace, putAudio } from './storage'
+  import {
+    assembleProject,
+    clone,
+    createVersion,
+    diffSnapshots,
+    freshBundle,
+    makeSnapshot,
+    snapshotsEqual,
+    uid,
+    type DiffParts
+  } from './versioning'
+  import type {
+    Attempt,
+    AttemptBundle,
+    Intonation,
+    PracticeProject,
+    SenseGroup,
+    StressLevel,
+    WorkspaceState
+  } from './types'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -13,13 +32,16 @@
     { value: 'fall-rise', label: '先降后升 ↘↗' }
   ]
 
-  let project: PracticeProject = createSampleProject()
+  let workspace: WorkspaceState = createSampleWorkspace()
+  let audioMap = new Map<string, Blob | null>()
+  let project: PracticeProject = assembleProject(workspace, audioMap)
   let loaded = false
   let saveStatus = '正在读取本机练习…'
   let online = true
   let selectedGroupId = project.groups[0]?.id ?? ''
   let selectedAttemptId = project.attempts.at(-1)?.id ?? ''
   let workspaceTab: 'annotate' | 'review' | 'progress' = 'annotate'
+  let versionPanelOpen = false
   let recording = false
   let recordingSeconds = 0
   let recordingFallback = false
@@ -38,56 +60,139 @@
   let issueNote = ''
   let feedbackText = ''
   let newCategory = ''
-  let undoStack: PracticeProject[] = []
-  let redoStack: PracticeProject[] = []
+  let undoStack: WorkspaceState[] = []
+  let redoStack: WorkspaceState[] = []
   let selectedGroup: SenseGroup | undefined
   let selectedAttempt: Attempt | undefined
 
+  // 工作区变化（或录音加载完成）后重新组装出界面试图使用的项目；录音按尝试 ID 注入，不复制
+  $: project = assembleProject(workspace, audioMap)
   $: selectedGroup = project.groups.find((group) => group.id === selectedGroupId) ?? project.groups[0]
   $: selectedAttempt = project.attempts.find((attempt) => attempt.id === selectedAttemptId) ?? project.attempts.at(-1)
   $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id) : undefined
+  // 该轮尝试是否在当前断句方案下留下过标注；没有时仍可按当前意群新开一套评分
+  $: selectedAttemptBound = selectedAttempt ? Boolean(workspace.draft.bundles[selectedAttempt.id]) : false
   $: completedAttempts = Math.min(project.attempts.length, project.targetAttempts)
   $: progress = Math.round((completedAttempts / Math.max(project.targetAttempts, 1)) * 100)
   $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
   $: averageDeviation = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.deviation, 0) / selectedAttempt.scores.length) : 0
   $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length }))
 
-  const clone = <T,>(value: T): T => structuredClone(value)
-  const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  // 当前稿所基于的版本与最新版本；与基准内容不同即视为有未存入版本库的改动
+  $: baseRecord = workspace.versions.find((item) => item.id === workspace.baseVersionId) ?? workspace.versions.at(-1) ?? null
+  $: draftDirty = baseRecord ? !snapshotsEqual(baseRecord, workspace.draft) : true
+  $: versionRows = workspace.versions
+    .map((record, index) => ({
+      record,
+      index,
+      diff: diffSnapshots(workspace.versions[index - 1] ?? null, record),
+      isBase: record.id === workspace.baseVersionId
+    }))
+    .reverse()
 
-  function editProject(mutator: (draft: PracticeProject) => void) {
-    const before = clone(project)
-    const draft = clone(project)
+  function mutate(mutator: (draft: WorkspaceState) => void) {
+    const before = clone(workspace)
+    const draft = clone(workspace)
     mutator(draft)
-    draft.updatedAt = new Date().toISOString()
-    project = draft
+    workspace = draft
     undoStack = [...undoStack.slice(-59), before]
     redoStack = []
     scheduleSave()
+  }
+
+  function editDraft(mutator: (draft: WorkspaceState['draft']) => void) {
+    mutate((ws) => mutator(ws.draft))
+  }
+
+  function editBundle(attemptId: string, mutator: (bundle: AttemptBundle) => void) {
+    editDraft((draft) => {
+      const bundle = draft.bundles[attemptId] ?? freshBundle(draft.groups)
+      draft.bundles[attemptId] = bundle
+      mutator(bundle)
+    })
   }
 
   function scheduleSave() {
     saveStatus = online ? '正在保存…' : '离线编辑中，稍后继续保存'
     window.clearTimeout(saveTimer)
     saveTimer = window.setTimeout(async () => {
-      const target = await savePractice(project)
+      const target = await persistWorkspace(workspace)
       saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份'
     }, 250)
+  }
+
+  /** 手动保存：把当前稿作为新版本存入本机版本库；与最新版本完全相同则不重复生成 */
+  async function commitVersion(): Promise<void> {
+    window.clearTimeout(saveTimer)
+    const latest = workspace.versions.at(-1) ?? null
+    if (latest && snapshotsEqual(latest, workspace.draft)) {
+      saveStatus = '当前稿与最近保存的版本相同，未重复保存'
+      return
+    }
+    const record = createVersion(workspace.draft)
+    mutate((ws) => {
+      ws.versions.push(record)
+      ws.baseVersionId = record.id
+    })
+    const target = await persistWorkspace(workspace)
+    saveStatus = target === 'indexeddb'
+      ? `已存入版本库 · 第 ${workspace.versions.length} 版`
+      : `已存入离线备份 · 第 ${workspace.versions.length} 版`
+  }
+
+  /** 打开某版：先把当前稿自动保存成新版本（若无改动则跳过），再恢复目标版本 */
+  async function openVersion(id: string) {
+    const target = workspace.versions.find((item) => item.id === id)
+    if (!target) return
+    stopPlayback()
+    window.clearTimeout(saveTimer)
+    const before = clone(workspace)
+    const next = clone(workspace)
+    const latest = next.versions.at(-1)
+    let autoSaved = false
+    if (!latest || !snapshotsEqual(latest, next.draft)) {
+      next.versions.push(createVersion(makeSnapshot(next.draft)))
+      autoSaved = true
+    }
+    const targetIndex = next.versions.findIndex((item) => item.id === id)
+    next.draft = makeSnapshot(target)
+    next.baseVersionId = id
+    workspace = next
+    undoStack = [...undoStack.slice(-59), before]
+    redoStack = []
+    selectedGroupId = next.draft.groups[0]?.id ?? ''
+    // 优先选中该版本保存时已有评分/反馈的最后一轮，让恢复的标注直接可见
+    const scoredInVersion = next.attempts.filter((meta) => target.bundles[meta.id])
+    selectedAttemptId = scoredInVersion.at(-1)?.id ?? next.attempts.at(-1)?.id ?? ''
+    versionPanelOpen = false
+    const backend = await persistWorkspace(workspace)
+    saveStatus = `已恢复第 ${targetIndex + 1} 版${autoSaved ? '，切换前的稿件已自动存为新版本' : ''}（${backend === 'indexeddb' ? '本机' : '离线备份'}）`
+  }
+
+  async function removeVersion(id: string) {
+    const index = workspace.versions.findIndex((item) => item.id === id)
+    if (index < 0) return
+    if (!confirm(`删除第 ${index + 1} 版只影响这份快照，共用的录音与其他版本保留，确定删除吗？`)) return
+    mutate((ws) => {
+      ws.versions = ws.versions.filter((item) => item.id !== id)
+      if (ws.baseVersionId === id) ws.baseVersionId = ws.versions.at(-1)?.id ?? null
+    })
+    saveStatus = `已删除第 ${index + 1} 版，录音与其他版本未受影响`
   }
 
   function undo() {
     const target = undoStack.pop()
     if (!target) return
-    redoStack = [...redoStack, clone(project)]
-    project = target
+    redoStack = [...redoStack, clone(workspace)]
+    workspace = target
     scheduleSave()
   }
 
   function redo() {
     const target = redoStack.pop()
     if (!target) return
-    undoStack = [...undoStack, clone(project)]
-    project = target
+    undoStack = [...undoStack, clone(workspace)]
+    workspace = target
     scheduleSave()
   }
 
@@ -97,7 +202,7 @@
   }
 
   function updateGroup(field: keyof SenseGroup, value: string | number | string[]) {
-    editProject((draft) => {
+    editDraft((draft) => {
       const group = draft.groups.find((item) => item.id === selectedGroupId)
       if (!group) return
       ;(group as unknown as Record<string, unknown>)[field] = value
@@ -120,17 +225,18 @@
 
   function addGroup() {
     const id = uid('group')
-    editProject((draft) => {
+    editDraft((draft) => {
       draft.groups.push({ id, text: '新的意群', stressWords: [], stressLevel: 1, pauseMs: 300, intonation: 'flat', note: '' })
     })
     selectedGroupId = id
   }
 
   function deleteGroup() {
-    if (!selectedGroup || project.groups.length <= 1) return
-    const index = project.groups.findIndex((group) => group.id === selectedGroup.id)
-    editProject((draft) => { draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id) })
-    selectedGroupId = project.groups[Math.max(0, index - 1)]?.id ?? ''
+    if (!selectedGroup || workspace.draft.groups.length <= 1) return
+    const index = workspace.draft.groups.findIndex((group) => group.id === selectedGroup?.id)
+    editDraft((draft) => { draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id) })
+    const remaining = workspace.draft.groups
+    selectedGroupId = remaining[Math.max(0, index - 1)]?.id ?? remaining[0]?.id ?? ''
   }
 
   function moveGroup(direction: -1 | 1) {
@@ -138,7 +244,7 @@
     const index = project.groups.findIndex((group) => group.id === selectedGroup?.id)
     const next = index + direction
     if (next < 0 || next >= project.groups.length) return
-    editProject((draft) => {
+    editDraft((draft) => {
       const [group] = draft.groups.splice(index, 1)
       draft.groups.splice(next, 0, group)
     })
@@ -147,7 +253,7 @@
   function splitSentence() {
     const parts = project.sentence.split(/[，。！？；、\n]+/).map((part) => part.trim()).filter(Boolean)
     if (parts.length < 2) return
-    editProject((draft) => {
+    editDraft((draft) => {
       draft.groups = parts.map((text, index) => ({
         id: draft.groups[index]?.id ?? uid('group'),
         text,
@@ -162,7 +268,7 @@
   }
 
   function updateSentence(value: string) {
-    editProject((draft) => { draft.sentence = value })
+    editDraft((draft) => { draft.sentence = value })
   }
 
   async function startRecording() {
@@ -174,7 +280,7 @@
       mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true })
       mediaRecorder = new MediaRecorder(mediaStream)
       mediaRecorder.ondataavailable = (event) => { if (event.data.size) mediaChunks.push(event.data) }
-      mediaRecorder.onstop = () => finishRecording(recordingFallback)
+      mediaRecorder.onstop = () => void finishRecording(recordingFallback)
       mediaRecorder.start()
     } catch {
       recordingFallback = true
@@ -189,10 +295,10 @@
   function stopRecording() {
     if (!recording) return
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop()
-    else finishRecording(true)
+    else void finishRecording(true)
   }
 
-  function finishRecording(simulated: boolean) {
+  async function finishRecording(simulated: boolean) {
     if (!recording) return
     recording = false
     window.clearInterval(recordingTimer)
@@ -201,29 +307,48 @@
     mediaRecorder = null
     const blob = !simulated && mediaChunks.length ? new Blob(mediaChunks, { type: mediaChunks[0].type || 'audio/webm' }) : undefined
     const attemptId = uid('attempt')
-    const number = project.attempts.length + 1
+    const number = workspace.attempts.length + 1
     const duration = Number(Math.max(0.5, recordingSeconds).toFixed(1))
-    const attempt: Attempt = {
-      id: attemptId,
-      number,
-      label: simulated ? `第 ${number} 轮 · 离线模拟` : `第 ${number} 轮`,
-      createdAt: new Date().toISOString(),
-      duration,
-      audioBlob: blob,
-      audioMime: blob?.type ?? 'audio/webm',
-      simulated,
-      rangeStart: 0,
-      rangeEnd: duration,
-      scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
-      wordIssues: [],
-      feedback: [],
-      selfNote: ''
+    if (blob) {
+      // 录音只存这一份，之后所有版本通过尝试 ID 共用
+      audioMap.set(attemptId, blob)
+      audioMap = new Map(audioMap)
+      audioUrls.set(attemptId, URL.createObjectURL(blob))
+      await putAudio(attemptId, blob)
     }
-    if (blob) audioUrls.set(attemptId, URL.createObjectURL(blob))
-    editProject((draft) => { draft.attempts.push(attempt) })
+    mutate((ws) => {
+      ws.attempts.push({
+        id: attemptId,
+        number,
+        label: simulated ? `第 ${number} 轮 · 离线模拟` : `第 ${number} 轮`,
+        createdAt: new Date().toISOString(),
+        duration,
+        audioMime: blob?.type ?? 'audio/webm',
+        simulated,
+        rangeStart: 0,
+        rangeEnd: duration,
+        selfNote: '',
+        hasAudio: Boolean(blob)
+      })
+      // 当前断句方案下的一套初始评分；旧方案下的评分仍保留在各自版本快照里
+      ws.draft.bundles[attemptId] = freshBundle(ws.draft.groups)
+    })
     selectedAttemptId = attemptId
     workspaceTab = 'review'
     recordingSeconds = duration
+  }
+
+  // 启动后从共享录音表懒加载 Blob；每轮录音只读取这一份
+  async function hydrateAudio() {
+    let changed = false
+    for (const meta of workspace.attempts) {
+      if (meta.hasAudio && !audioMap.has(meta.id)) {
+        const blob = await getAudio(meta.id)
+        audioMap.set(meta.id, blob)
+        changed = true
+      }
+    }
+    if (changed) audioMap = new Map(audioMap)
   }
 
   function audioUrlFor(attempt?: Attempt) {
@@ -272,12 +397,11 @@
 
   function updateScore(field: 'accuracy' | 'rhythm' | 'deviation', value: number) {
     if (!selectedAttempt || !selectedGroup) return
-    editProject((draft) => {
-      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
-      let score = attempt?.scores.find((item) => item.groupId === selectedGroupId)
-      if (!attempt || !score) {
-        attempt?.scores.push({ groupId: selectedGroupId, accuracy: 70, rhythm: 70, deviation: 0, note: '' })
-        score = attempt?.scores.at(-1)
+    editBundle(selectedAttempt.id, (bundle) => {
+      let score = bundle.scores.find((item) => item.groupId === selectedGroupId)
+      if (!score) {
+        bundle.scores.push({ groupId: selectedGroupId, accuracy: 70, rhythm: 70, deviation: 0, note: '' })
+        score = bundle.scores.at(-1)
       }
       if (score) score[field] = value
     })
@@ -285,37 +409,37 @@
 
   function updateScoreNote(value: string) {
     if (!selectedAttempt || !selectedGroup) return
-    editProject((draft) => {
-      const score = draft.attempts.find((attempt) => attempt.id === selectedAttemptId)?.scores.find((item) => item.groupId === selectedGroupId)
+    editBundle(selectedAttempt.id, (bundle) => {
+      const score = bundle.scores.find((item) => item.groupId === selectedGroupId)
       if (score) score.note = value
     })
   }
 
   function addWordIssue() {
     if (!selectedAttempt || !selectedGroup || !issueWord.trim()) return
-    editProject((draft) => {
-      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
-      attempt?.wordIssues.push({ id: uid('issue'), groupId: selectedGroupId, word: issueWord.trim(), category: issueCategory, note: issueNote.trim() })
+    editBundle(selectedAttempt.id, (bundle) => {
+      bundle.wordIssues.push({ id: uid('issue'), groupId: selectedGroupId, word: issueWord.trim(), category: issueCategory, note: issueNote.trim() })
     })
     issueWord = ''
     issueNote = ''
   }
 
   function removeWordIssue(issueId: string) {
-    editProject((draft) => {
-      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
-      if (attempt) attempt.wordIssues = attempt.wordIssues.filter((issue) => issue.id !== issueId)
+    if (!selectedAttempt) return
+    editBundle(selectedAttempt.id, (bundle) => {
+      bundle.wordIssues = bundle.wordIssues.filter((issue) => issue.id !== issueId)
     })
   }
 
   function addFeedback() {
     if (!selectedGroup || !feedbackText.trim()) return
-    editProject((draft) => {
-      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
-      attempt?.feedback.push({
+    const attemptId = selectedAttemptId
+    const teacher = workspace.teacher
+    editBundle(attemptId, (bundle) => {
+      bundle.feedback.push({
         id: uid('feedback'),
         groupId: selectedGroupId,
-        teacher: draft.teacher,
+        teacher,
         text: feedbackText.trim(),
         createdAt: new Date().toISOString()
       })
@@ -325,8 +449,8 @@
 
   function updateRange(field: 'rangeStart' | 'rangeEnd', value: number) {
     if (!selectedAttempt) return
-    editProject((draft) => {
-      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
+    mutate((ws) => {
+      const attempt = ws.attempts.find((item) => item.id === selectedAttemptId)
       if (!attempt) return
       attempt[field] = value
       if (attempt.rangeEnd <= attempt.rangeStart) {
@@ -336,43 +460,78 @@
     })
   }
 
+  function updateSelfNote(value: string) {
+    mutate((ws) => {
+      const attempt = ws.attempts.find((item) => item.id === selectedAttemptId)
+      if (attempt) attempt.selfNote = value
+    })
+  }
+
   function addCategory() {
-    if (!newCategory.trim() || project.errorCategories.includes(newCategory.trim())) return
-    editProject((draft) => { draft.errorCategories.push(newCategory.trim()) })
+    if (!newCategory.trim() || workspace.errorCategories.includes(newCategory.trim())) return
+    mutate((ws) => { ws.errorCategories.push(newCategory.trim()) })
     newCategory = ''
   }
 
-  function resetSample() {
-    if (!confirm('恢复示例会替换当前练习，确定继续吗？')) return
-    editProject((draft) => { Object.assign(draft, clone(createSampleProject())) })
-    selectedGroupId = project.groups[0]?.id ?? ''
-    selectedAttemptId = project.attempts.at(-1)?.id ?? ''
-  }
-
-  async function deleteAllData() {
-    if (!confirm('这会清除本机全部练习、录音与反馈，且不能撤销。')) return
+  async function resetToSample(wipe: boolean) {
+    if (!confirm(wipe
+      ? '这会清除本机全部练习、版本与录音，恢复成内置示例，且不能撤销。'
+      : '恢复示例会替换当前练习与全部版本（共用录音保留在本机但不再被引用），确定继续吗？')) return
     stopPlayback()
-    await clearPractice()
-    const sample = createSampleProject()
-    project = sample
-    selectedGroupId = sample.groups[0]?.id ?? ''
-    selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
+    if (wipe) await clearWorkspace()
+    audioUrls.forEach((url) => URL.revokeObjectURL(url))
+    audioUrls = new Map()
+    audioMap = new Map()
+    const seeded = createSampleWorkspace()
+    workspace = seeded
+    selectedGroupId = seeded.draft.groups[0]?.id ?? ''
+    selectedAttemptId = seeded.attempts.at(-1)?.id ?? ''
     undoStack = []
     redoStack = []
-    await savePractice(project)
+    versionPanelOpen = false
+    await persistWorkspace(workspace)
+    saveStatus = wipe ? '已清除本机数据并恢复示例' : '已恢复示例，版本库已重新生成'
+  }
+
+  function formatTime(iso: string) {
+    return new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  }
+
+  function diffSummary(parts: DiffParts): string[] {
+    const labels: Array<[keyof DiffParts, string]> = [
+      ['title', '标题'],
+      ['sentence', '原文'],
+      ['translation', '释义'],
+      ['added', '新增意群'],
+      ['removed', '删除意群'],
+      ['reordered', '意群顺序'],
+      ['text', '意群文本'],
+      ['stress', '重音'],
+      ['pause', '停顿'],
+      ['intonation', '语调'],
+      ['note', '学习提示'],
+      ['scores', '评分'],
+      ['issues', '错词'],
+      ['feedback', '教师反馈']
+    ]
+    return labels
+      .filter(([key]) => parts[key] > 0)
+      .map(([key, label]) => (key === 'reordered' ? label : `${label} ${parts[key]}`))
   }
 
   function onKeydown(event: KeyboardEvent) {
     const command = event.ctrlKey || event.metaKey
     if (command && event.key.toLowerCase() === 's') {
       event.preventDefault()
-      void savePractice(project).then(() => { saveStatus = '已保存到本机' })
+      void commitVersion()
     } else if (command && event.key.toLowerCase() === 'z') {
       event.preventDefault()
       event.shiftKey ? redo() : undo()
     } else if (command && event.key.toLowerCase() === 'y') {
       event.preventDefault()
       redo()
+    } else if (event.key === 'Escape' && versionPanelOpen) {
+      versionPanelOpen = false
     } else if (event.altKey && event.key.toLowerCase() === 'r') {
       event.preventDefault()
       recording ? stopRecording() : void startRecording()
@@ -389,12 +548,18 @@
 
   onMount(async () => {
     online = navigator.onLine
-    const saved = await loadPractice()
-    if (saved) project = saved
-    selectedGroupId = project.groups[0]?.id ?? ''
-    selectedAttemptId = project.attempts.at(-1)?.id ?? ''
+    let loadedWorkspace = await loadWorkspace()
+    if (!loadedWorkspace) {
+      // 旧练习会在存储层迁移时自动生成首版；全新环境用示例生成一份带首版的工作区
+      loadedWorkspace = createSampleWorkspace()
+      await persistWorkspace(loadedWorkspace)
+    }
+    workspace = loadedWorkspace
+    selectedGroupId = workspace.draft.groups[0]?.id ?? ''
+    selectedAttemptId = workspace.attempts.at(-1)?.id ?? ''
     loaded = true
-    saveStatus = saved ? '已恢复本机练习' : '示例练习已就绪'
+    saveStatus = '已恢复本机练习'
+    void hydrateAudio()
     window.addEventListener('online', () => { online = true })
     window.addEventListener('offline', () => { online = false })
     window.addEventListener('keydown', onKeydown)
@@ -425,14 +590,26 @@
     </div>
     <div class="practice-title">
       <h1>{project.title}</h1>
-      <span>{project.teacher} · 手机与电脑自动适配</span>
+      <span>
+        {project.teacher} ·
+        {#if baseRecord}
+          基于第 {workspace.versions.findIndex((item) => item.id === baseRecord.id) + 1} 版（{formatTime(baseRecord.savedAt)}）
+        {:else}
+          尚未存入版本
+        {/if}
+        {#if draftDirty}<em class="dirty-mark">· 当前稿有未保存改动</em>{/if}
+      </span>
     </div>
     <div class="header-actions">
       <span class:offline={!online} class="connection badge">{online ? '在线' : '离线编辑'}</span>
       <span class="save-state">{saveStatus}</span>
+      <button class="btn btn-sm variant-soft-primary" on:click={() => versionPanelOpen = true}>
+        版本库 · {workspace.versions.length}
+      </button>
+      <button class="btn btn-sm variant-filled-primary" on:click={commitVersion}>存入版本库</button>
       <button class="btn btn-sm variant-ghost" on:click={undo} disabled={!undoStack.length}>撤销</button>
       <button class="btn btn-sm variant-ghost" on:click={redo} disabled={!redoStack.length}>重做</button>
-      <button class="btn btn-sm variant-ghost" on:click={resetSample}>恢复示例</button>
+      <button class="btn btn-sm variant-ghost" on:click={() => resetToSample(false)}>恢复示例</button>
     </div>
   </header>
 
@@ -460,12 +637,16 @@
         <button class="btn btn-sm variant-soft-primary" on:click={addGroup}>＋ 意群</button>
       </div>
       <label class="label">
+        <span>练习标题</span>
+        <input class="input" value={project.title} on:input={(event) => editDraft((draft) => { draft.title = event.currentTarget.value })} />
+      </label>
+      <label class="label">
         <span>录入句子</span>
         <textarea class="textarea" rows="4" value={project.sentence} on:input={(event) => updateSentence(event.currentTarget.value)}></textarea>
       </label>
       <label class="label">
         <span>英文释义 / 参考</span>
-        <textarea class="textarea" rows="3" value={project.translation} on:input={(event) => editProject((draft) => draft.translation = event.currentTarget.value)}></textarea>
+        <textarea class="textarea" rows="3" value={project.translation} on:input={(event) => editDraft((draft) => { draft.translation = event.currentTarget.value })}></textarea>
       </label>
       <div class="inline-actions">
         <button class="btn btn-sm variant-soft" on:click={splitSentence}>按标点智能切分</button>
@@ -490,7 +671,7 @@
       <div class="shortcut-note">
         <strong>快捷操作</strong>
         <span>Alt + ↑/↓ 调整意群 · Alt+R 开始/停止录音</span>
-        <span>← / → 切换意群 · ⌘S 保存 · ⌘Z 撤销</span>
+        <span>← / → 切换意群 · ⌘S 存入版本库 · ⌘Z 撤销</span>
       </div>
     </aside>
 
@@ -568,7 +749,7 @@
             <button class:variant-filled-error={recording} class:variant-filled-primary={!recording} class="btn record-button" on:click={() => recording ? stopRecording() : startRecording()}>
               {recording ? '■ 停止并保存尝试' : '● 开始录音'}
             </button>
-            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅保存在当前设备 IndexedDB，不会上传。'}</p>
+            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅在各版本间共用一份，保存在当前设备 IndexedDB，不会上传。'}</p>
           </div>
         </div>
       </section>
@@ -578,13 +759,13 @@
       <div class="card attempts-card">
         <div class="section-heading">
           <div><span class="eyebrow">TAKES</span><h2>多轮尝试</h2></div>
-          <span class="chapter-badge">{project.attempts.length} 轮</span>
+          <span class="chapter-badge">{project.attempts.length} 轮 · 录音跨版本共用</span>
         </div>
         <div class="attempt-list">
           {#each [...project.attempts].reverse() as attempt}
             <button class:active={attempt.id === selectedAttempt?.id} class="attempt-item" on:click={() => { selectedAttemptId = attempt.id; stopPlayback() }}>
               <span class="attempt-number">{attempt.number}</span>
-              <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}</small></span>
+              <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}{#if !workspace.draft.bundles[attempt.id]} · 本方案未评分{/if}</small></span>
               <span class="attempt-score">{attempt.scores.length ? Math.round(attempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / attempt.scores.length) : 0}%</span>
             </button>
           {/each}
@@ -597,6 +778,9 @@
             <div><span class="eyebrow">COMPARE</span><h2>回听与偏差</h2></div>
             <button class="btn btn-sm variant-filled-primary" on:click={togglePlayback}>{playing ? '■ 停止' : '▶ 播放范围'}</button>
           </div>
+          {#if !selectedAttemptBound}
+            <p class="bound-hint">这轮录音录自其他断句方案；下方评分会按当前意群新开一套，原方案的评分仍保留在对应版本里。</p>
+          {/if}
           <audio bind:this={audioElement} src={audioUrlFor(selectedAttempt)} on:timeupdate={onAudioTimeUpdate} on:ended={stopPlayback}></audio>
           <div class="playback-timeline">
             <div class="playhead" style={`left:${selectedAttempt.duration ? Math.min(100, playbackTime / selectedAttempt.duration * 100) : 0}%`}></div>
@@ -614,7 +798,7 @@
             </div>
             <label class="label"><span>本意群偏差说明</span><textarea class="textarea" rows="2" value={selectedScore.note} on:input={(event) => updateScoreNote(event.currentTarget.value)}></textarea></label>
           {/if}
-          <label class="label"><span>本轮自评</span><textarea class="textarea" rows="2" value={selectedAttempt.selfNote} on:input={(event) => editProject((draft) => { const attempt = draft.attempts.find((item) => item.id === selectedAttemptId); if (attempt) attempt.selfNote = event.currentTarget.value })}></textarea></label>
+          <label class="label"><span>本轮自评</span><textarea class="textarea" rows="2" value={selectedAttempt.selfNote} on:input={(event) => updateSelfNote(event.currentTarget.value)}></textarea></label>
         </div>
 
         <div class:recommended={workspaceTab === 'review'} class="card issues-card">
@@ -680,11 +864,57 @@
         <div class="inline-actions">
           <input class="input" bind:value={newCategory} placeholder="新增错词分类" />
           <button class="btn btn-sm variant-soft" on:click={addCategory}>添加分类</button>
-          <button class="btn btn-sm variant-ghost text-error-500" on:click={deleteAllData}>清除本机数据</button>
+          <button class="btn btn-sm variant-ghost" on:click={() => versionPanelOpen = true}>版本库</button>
+          <button class="btn btn-sm variant-ghost text-error-500" on:click={() => resetToSample(true)}>清除本机数据</button>
         </div>
       </section>
     {/if}
   </main>
+
+  {#if versionPanelOpen}
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+    <div class="version-overlay" on:click={() => (versionPanelOpen = false)} role="presentation">
+      <div class="version-panel card" on:click|stopPropagation role="dialog" aria-modal="true" aria-label="本机版本库">
+        <div class="section-heading">
+          <div><span class="eyebrow">VERSIONS</span><h2>本机版本库</h2></div>
+          <button class="btn btn-sm variant-ghost" on:click={() => versionPanelOpen = false}>关闭</button>
+        </div>
+        <p class="version-note">
+          手动保存（⌘S 或“存入版本库”）会记下标题、原文与意群的重音、停顿、语调；打开旧版前当前稿会自动先存一份。
+          录音各版本共用，删除版本只删除该版标注。
+        </p>
+        <div class="version-list">
+          {#each versionRows as row}
+            <div class="version-row">
+              <div class="version-main">
+                <div class="version-line">
+                  <strong>第 {row.index + 1} 版</strong>
+                  <span class="version-time">{formatTime(row.record.savedAt)}</span>
+                  {#if row.isBase}<span class="badge variant-filled-success">当前稿基于此版</span>{/if}
+                </div>
+                <div class="version-title">{row.record.title || '未命名练习'}</div>
+                <div class="version-groups">{row.record.groups.map((group) => group.text).join(' / ')}</div>
+                <div class="version-diff">
+                  {#if row.index === 0}
+                    <span>首个版本 · {row.record.groups.length} 个意群</span>
+                  {:else}
+                    <span class="diff-count">与上一版 {row.diff.total} 处改动</span>
+                    {#if row.diff.total}
+                      <span class="diff-parts">{diffSummary(row.diff.parts).join('、')}</span>
+                    {/if}
+                  {/if}
+                </div>
+              </div>
+              <div class="version-ops">
+                <button class="btn btn-sm variant-filled-primary" on:click={() => openVersion(row.record.id)}>打开</button>
+                <button class="btn btn-sm variant-ghost text-error-500" on:click={() => removeVersion(row.record.id)}>删除</button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      </div>
+    </div>
+  {/if}
 
   {#if !loaded}
     <div class="loading-overlay"><span class="loading-bar">正在恢复离线练习…</span></div>
