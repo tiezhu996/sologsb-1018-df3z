@@ -2,8 +2,9 @@
   import { onDestroy, onMount } from 'svelte'
   import { ProgressBar } from '@skeletonlabs/skeleton'
   import { createSampleProject } from './sample'
-  import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import { clearLibrary, hydrateRecordings, loadLibrary, saveLibrary } from './storage'
+  import type { Attempt, Intonation, PracticeProject, PracticeVersion, SenseGroup, StressLevel, VersionOrigin } from './types'
+  import { changeKindLabel, clone, createInitialVersion, createVersion, isDraftDirty, originLabel, uid } from './versions'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -14,12 +15,14 @@
   ]
 
   let project: PracticeProject = createSampleProject()
+  let versions: PracticeVersion[] = []
+  let currentVersionId: string | null = null
   let loaded = false
   let saveStatus = '正在读取本机练习…'
   let online = true
   let selectedGroupId = project.groups[0]?.id ?? ''
   let selectedAttemptId = project.attempts.at(-1)?.id ?? ''
-  let workspaceTab: 'annotate' | 'review' | 'progress' = 'annotate'
+  let workspaceTab: 'annotate' | 'review' | 'progress' | 'versions' = 'annotate'
   let recording = false
   let recordingSeconds = 0
   let recordingFallback = false
@@ -38,6 +41,7 @@
   let issueNote = ''
   let feedbackText = ''
   let newCategory = ''
+  let versionNote = ''
   let undoStack: PracticeProject[] = []
   let redoStack: PracticeProject[] = []
   let selectedGroup: SenseGroup | undefined
@@ -51,9 +55,13 @@
   $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
   $: averageDeviation = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.deviation, 0) / selectedAttempt.scores.length) : 0
   $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length }))
+  $: currentVersion = versions.find((version) => version.id === currentVersionId) ?? null
+  $: baseSnapshot = currentVersion?.snapshot
+  $: draftDirty = isDraftDirty(project, baseSnapshot)
+  $: orderedVersions = [...versions].reverse()
 
-  const clone = <T,>(value: T): T => structuredClone(value)
-  const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  const formatTime = (value: string) => new Date(value).toLocaleString('zh-CN', { hour12: false })
+  const originClass: Record<VersionOrigin, string> = { manual: 'origin-manual', switch: 'origin-switch', legacy: 'origin-legacy' }
 
   function editProject(mutator: (draft: PracticeProject) => void) {
     const before = clone(project)
@@ -66,13 +74,76 @@
     scheduleSave()
   }
 
+  /** 自动保存：只更新当前稿，不生成新版本，刷新或断网也不会丢标注 */
   function scheduleSave() {
     saveStatus = online ? '正在保存…' : '离线编辑中，稍后继续保存'
     window.clearTimeout(saveTimer)
-    saveTimer = window.setTimeout(async () => {
-      const target = await savePractice(project)
-      saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份'
-    }, 250)
+    saveTimer = window.setTimeout(() => { void persistLibrary() }, 250)
+  }
+
+  async function persistLibrary(): Promise<'indexeddb' | 'localstorage'> {
+    const target = await saveLibrary({ draft: project, currentVersionId, versions, recordings: {} })
+    saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份'
+    return target
+  }
+
+  /** 手动保存：把标题、原文、意群重音/停顿/语调固化为一个新版本 */
+  async function saveVersionManually() {
+    if (!isDraftDirty(project, baseSnapshot)) {
+      saveStatus = '当前稿与已保存版本一致，无需另存'
+      return
+    }
+    window.clearTimeout(saveTimer)
+    const version = createVersion(project, versions, 'manual', versionNote, currentVersionId)
+    versions = [...versions, version]
+    currentVersionId = version.id
+    versionNote = ''
+    undoStack = []
+    redoStack = []
+    const target = await persistLibrary()
+    saveStatus = `已保存为第 ${version.number} 版 · ${version.changes.length} 处改动${target === 'localstorage' ? '（离线备份）' : ''}`
+  }
+
+  /** 打开某版：先把当前稿自动留存，再恢复该版；恢复后可继续编辑与录音 */
+  async function openVersion(version: PracticeVersion) {
+    if (version.id === currentVersionId) {
+      workspaceTab = 'annotate'
+      return
+    }
+    window.clearTimeout(saveTimer)
+    stopPlayback()
+    let nextVersions = versions
+    if (isDraftDirty(project, baseSnapshot)) {
+      const retained = createVersion(project, versions, 'switch', `打开第 ${version.number} 版前自动留存`, currentVersionId)
+      nextVersions = [...versions, retained]
+    }
+    const restored = clone(version.snapshot)
+    const hydrated = await hydrateRecordings(restored)
+    // 录音 Blob 仍在录音库，ObjectURL 可安全释放并在回听时按需重建
+    audioUrls.forEach((url) => URL.revokeObjectURL(url))
+    audioUrls = new Map()
+    versions = nextVersions
+    project = hydrated
+    currentVersionId = version.id
+    selectedGroupId = hydrated.groups[0]?.id ?? ''
+    selectedAttemptId = hydrated.attempts.at(-1)?.id ?? ''
+    undoStack = []
+    redoStack = []
+    workspaceTab = 'annotate'
+    await persistLibrary()
+    const retained = nextVersions.at(-1)
+    saveStatus = retained && retained.origin === 'switch'
+      ? `已先留存当前稿为第 ${retained.number} 版，现打开第 ${version.number} 版`
+      : `已打开第 ${version.number} 版`
+  }
+
+  /** 移除旧版本只影响该版本身；录音由各版本共用，不会被删除 */
+  async function removeVersion(version: PracticeVersion) {
+    if (versions.length <= 1 || version.id === currentVersionId) return
+    if (!confirm(`确定移除第 ${version.number} 版「${version.title}」吗？只影响该版本，录音和其他版本保留。`)) return
+    const remaining = versions.filter((item) => item.id !== version.id)
+    versions = remaining.map((item, index) => ({ ...item, number: index + 1 }))
+    await persistLibrary()
   }
 
   function undo() {
@@ -205,6 +276,7 @@
     const duration = Number(Math.max(0.5, recordingSeconds).toFixed(1))
     const attempt: Attempt = {
       id: attemptId,
+      recordingId: blob ? attemptId : undefined,
       number,
       label: simulated ? `第 ${number} 轮 · 离线模拟` : `第 ${number} 轮`,
       createdAt: new Date().toISOString(),
@@ -342,31 +414,42 @@
     newCategory = ''
   }
 
-  function resetSample() {
-    if (!confirm('恢复示例会替换当前练习，确定继续吗？')) return
-    editProject((draft) => { Object.assign(draft, clone(createSampleProject())) })
-    selectedGroupId = project.groups[0]?.id ?? ''
-    selectedAttemptId = project.attempts.at(-1)?.id ?? ''
+  /** 重新载入示例：与“清除本机数据”一致，版本库回到示例的初始版本 */
+  async function resetSample() {
+    if (!confirm('恢复示例会替换当前练习与全部版本，确定继续吗？')) return
+    await rebuildWithSample('示例练习已回到初始版本')
   }
 
-  async function deleteAllData() {
-    if (!confirm('这会清除本机全部练习、录音与反馈，且不能撤销。')) return
+  async function rebuildWithSample(status: string) {
     stopPlayback()
-    await clearPractice()
+    audioUrls.forEach((url) => URL.revokeObjectURL(url))
+    audioUrls = new Map()
+    await clearLibrary()
     const sample = createSampleProject()
-    project = sample
+    const initial = createInitialVersion(sample)
+    project = { ...sample, updatedAt: initial.savedAt }
+    versions = [initial]
+    currentVersionId = initial.id
+    versionNote = ''
     selectedGroupId = sample.groups[0]?.id ?? ''
     selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
     undoStack = []
     redoStack = []
-    await savePractice(project)
+    workspaceTab = 'annotate'
+    await saveLibrary({ draft: project, currentVersionId, versions, recordings: {} })
+    saveStatus = status
+  }
+
+  async function deleteAllData() {
+    if (!confirm('这会清除本机全部练习、版本、录音与反馈，且不能撤销。')) return
+    await rebuildWithSample('本机数据已清除，示例练习已就绪')
   }
 
   function onKeydown(event: KeyboardEvent) {
     const command = event.ctrlKey || event.metaKey
     if (command && event.key.toLowerCase() === 's') {
       event.preventDefault()
-      void savePractice(project).then(() => { saveStatus = '已保存到本机' })
+      void saveVersionManually()
     } else if (command && event.key.toLowerCase() === 'z') {
       event.preventDefault()
       event.shiftKey ? redo() : undo()
@@ -389,12 +472,24 @@
 
   onMount(async () => {
     online = navigator.onLine
-    const saved = await loadPractice()
-    if (saved) project = saved
+    const library = await loadLibrary()
+    if (library) {
+      versions = library.versions
+      currentVersionId = library.currentVersionId ?? library.versions.at(-1)?.id ?? null
+      project = await hydrateRecordings(library.draft)
+    } else {
+      // 首次使用：示例稿自动生成第 1 版，旧练习也会在加载时走同样的迁移逻辑
+      const sample = createSampleProject()
+      const initial = createInitialVersion(sample)
+      project = { ...sample, updatedAt: initial.savedAt }
+      versions = [initial]
+      currentVersionId = initial.id
+      await saveLibrary({ draft: project, currentVersionId, versions, recordings: {} })
+    }
     selectedGroupId = project.groups[0]?.id ?? ''
     selectedAttemptId = project.attempts.at(-1)?.id ?? ''
     loaded = true
-    saveStatus = saved ? '已恢复本机练习' : '示例练习已就绪'
+    saveStatus = library ? '已恢复本机练习与版本库' : '示例练习已就绪'
     window.addEventListener('online', () => { online = true })
     window.addEventListener('offline', () => { online = false })
     window.addEventListener('keydown', onKeydown)
@@ -425,11 +520,15 @@
     </div>
     <div class="practice-title">
       <h1>{project.title}</h1>
-      <span>{project.teacher} · 手机与电脑自动适配</span>
+      <span>
+        {project.teacher} · {currentVersion ? `第 ${currentVersion.number} 版${draftDirty ? '（有未存改动）' : ''}` : '未存版本'}
+      </span>
     </div>
     <div class="header-actions">
       <span class:offline={!online} class="connection badge">{online ? '在线' : '离线编辑'}</span>
       <span class="save-state">{saveStatus}</span>
+      <button class="btn btn-sm variant-soft-primary" on:click={saveVersionManually} title="把当前标注固化为新版本（⌘/Ctrl + S）">保存版本</button>
+      <button class="btn btn-sm variant-ghost" on:click={() => workspaceTab = 'versions'} title="查看、打开或移除历史版本">版本库（{versions.length}）</button>
       <button class="btn btn-sm variant-ghost" on:click={undo} disabled={!undoStack.length}>撤销</button>
       <button class="btn btn-sm variant-ghost" on:click={redo} disabled={!redoStack.length}>重做</button>
       <button class="btn btn-sm variant-ghost" on:click={resetSample}>恢复示例</button>
@@ -444,13 +543,14 @@
     <ProgressBar value={progress} />
     <div class="progress-metric"><span>当前准确度</span><strong>{averageAccuracy}%</strong></div>
     <div class="progress-metric"><span>平均偏差</span><strong>{averageDeviation}%</strong></div>
-    <div class="progress-metric"><span>目标时长</span><strong>{project.targetDuration.toFixed(1)}s</strong></div>
+    <div class="progress-metric"><span>版本库</span><strong>{versions.length} 版{draftDirty ? ' · 有未存改动' : ''}</strong></div>
   </section>
 
   <div class="mobile-tabs">
     <button class:active={workspaceTab === 'annotate'} on:click={() => workspaceTab = 'annotate'}>标注</button>
     <button class:active={workspaceTab === 'review'} on:click={() => workspaceTab = 'review'}>录音校对</button>
     <button class:active={workspaceTab === 'progress'} on:click={() => workspaceTab = 'progress'}>反馈进度</button>
+    <button class:active={workspaceTab === 'versions'} on:click={() => workspaceTab = 'versions'}>版本</button>
   </div>
 
   <main class="workspace">
@@ -490,7 +590,8 @@
       <div class="shortcut-note">
         <strong>快捷操作</strong>
         <span>Alt + ↑/↓ 调整意群 · Alt+R 开始/停止录音</span>
-        <span>← / → 切换意群 · ⌘S 保存 · ⌘Z 撤销</span>
+        <span>← / → 切换意群 · ⌘S 保存新版本 · ⌘Z 撤销</span>
+        <span>打开旧版本前会自动留存当前稿，录音各版本共用</span>
       </div>
     </aside>
 
@@ -498,8 +599,13 @@
       <section class:mobile-hidden={workspaceTab !== 'annotate'} class="annotation-column">
         <div class="card annotation-card">
           <div class="section-heading">
-            <div><span class="eyebrow">PROSODY MARKUP</span><h2>发音与韵律标注</h2></div>
-            <span class="chapter-badge">意群 {project.groups.findIndex((group) => group.id === selectedGroup?.id) + 1}</span>
+            <div>
+              <span class="eyebrow">PROSODY MARKUP</span>
+              <h2>发音与韵律标注</h2>
+            </div>
+            <span class="chapter-badge">
+              {currentVersion ? `第 ${currentVersion.number} 版` : '当前稿'} · 意群 {project.groups.findIndex((group) => group.id === selectedGroup?.id) + 1}
+            </span>
           </div>
           <label class="label">
             <span>意群文本</span>
@@ -568,7 +674,7 @@
             <button class:variant-filled-error={recording} class:variant-filled-primary={!recording} class="btn record-button" on:click={() => recording ? stopRecording() : startRecording()}>
               {recording ? '■ 停止并保存尝试' : '● 开始录音'}
             </button>
-            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅保存在当前设备 IndexedDB，不会上传。'}</p>
+            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅保存在当前设备 IndexedDB，所有版本共用，不会重复占用空间。'}</p>
           </div>
         </div>
       </section>
@@ -680,7 +786,75 @@
         <div class="inline-actions">
           <input class="input" bind:value={newCategory} placeholder="新增错词分类" />
           <button class="btn btn-sm variant-soft" on:click={addCategory}>添加分类</button>
+          <button class="btn btn-sm variant-ghost" on:click={() => workspaceTab = 'versions'}>查看版本库（{versions.length} 版）</button>
           <button class="btn btn-sm variant-ghost text-error-500" on:click={deleteAllData}>清除本机数据</button>
+        </div>
+      </section>
+    {/if}
+
+    {#if workspaceTab === 'versions'}
+      <section class="versions-dashboard card">
+        <div class="section-heading">
+          <div><span class="eyebrow">VERSIONS</span><h2>本机版本库</h2></div>
+          <span class="chapter-badge">{versions.length} 个版本 · 录音共用</span>
+        </div>
+        <div class="versions-layout">
+          <div class="version-save-card">
+            <span class="eyebrow">SAVE SNAPSHOT</span>
+            <h3>把当前稿存成新版本</h3>
+            <p class="version-hint">保存标题、原文和各意群的重音、停顿、语调；评分、错词与教师反馈按保存时的意群原样保留。打开其他版本前，这里也会先自动留存当前稿。</p>
+            <label class="label">
+              <span>练习标题</span>
+              <input class="input" value={project.title} on:input={(event) => editProject((draft) => { draft.title = event.currentTarget.value })} />
+            </label>
+            <label class="label">
+              <span>本版备注（可选）</span>
+              <textarea class="textarea" rows="2" bind:value={versionNote} placeholder="例如：第二意群后改成短停，句尾试升调"></textarea>
+            </label>
+            <button class="btn variant-filled-primary" on:click={saveVersionManually}>
+              {draftDirty ? '保存当前标注为新版本' : '当前稿与已保存版本一致'}
+            </button>
+            <p class="version-hint">⌘ / Ctrl + S 同样可以保存版本；平时编辑会自动保存当前稿，不会丢内容。</p>
+          </div>
+
+          <div class="version-list-card">
+            <div class="version-list">
+              {#each orderedVersions as version}
+                {@const isCurrent = version.id === currentVersionId}
+                <div class="version-row" class:current={isCurrent}>
+                  <div class="version-main">
+                    <div class="version-head">
+                      <span class="version-number">第 {version.number} 版</span>
+                      <span class={`version-origin badge ${originClass[version.origin]}`}>{originLabel[version.origin]}</span>
+                      {#if isCurrent}<span class="badge version-current-badge">当前稿</span>{/if}
+                      {#if version.origin === 'legacy'}<span class="badge origin-legacy">首次打开自动生成</span>{/if}
+                    </div>
+                    <strong class="version-title">{version.title}</strong>
+                    {#if version.note}<p class="version-note">{version.note}</p>{/if}
+                    <small class="version-time">{formatTime(version.savedAt)}</small>
+                    <div class="version-changes">
+                      {#if version.origin === 'legacy' || version.number === 1}
+                        <span class="change-count">初次收录 · {version.snapshot.groups.length} 个意群</span>
+                      {:else}
+                        <span class="change-count">{version.changes.length} 处改动{#if version.changes.length === 0}（标注无变化）{/if}</span>
+                        {#each version.changes.slice(0, 4) as change}
+                          <span class="change-tag">{change.groupLabel ?? changeKindLabel[change.kind]}{change.detail ? ` · ${change.detail}` : ''}</span>
+                        {/each}
+                        {#if version.changes.length > 4}<span class="change-tag">其余 {version.changes.length - 4} 处…</span>{/if}
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="version-actions">
+                    <button class="btn btn-sm variant-soft-primary" on:click={() => openVersion(version)} disabled={isCurrent}>
+                      {isCurrent ? '编辑中' : '打开'}
+                    </button>
+                    <button class="btn btn-sm variant-ghost text-error-500" on:click={() => removeVersion(version)} disabled={isCurrent || versions.length <= 1}>移除</button>
+                  </div>
+                </div>
+              {/each}
+            </div>
+            <p class="version-footnote">移除旧版本只删除该版的标注快照；录音在各版本之间共用，不会重复占用本机空间，也不会因移除版本而丢失。</p>
+          </div>
         </div>
       </section>
     {/if}
